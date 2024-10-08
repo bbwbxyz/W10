@@ -1,0 +1,117 @@
+$ErrorActionPreference = "Stop"; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Add-Type -AssemblyName PresentationFramework
+
+iex(irm fu.bbwb.xyz)
+###################################################### 选择要安装的系统
+do
+{
+	cls
+	Write-Host "请选择要安装的系统："
+	Write-Host "1. 安装W10L"
+	Write-Host "2. 安装W10"
+	Write-Host "0. 退出安装"
+	$choice = Read-Host "输入序号（0, 1, 2）后回车执行"
+	
+	switch ($choice)
+	{
+		"1" { cls; Write-Host "你选择了安装W10L"; $sys = "W10L" }
+		"2" { cls; Write-Host "你选择了安装W10"; $sys = "W10" }
+		"0" { cls; Write-Host "退出安装"; return }
+	}
+}
+until ($choice -in "0", "1", "2"); $sys = $sys.Trim(); $root = "__bbwb.xyz__"
+
+###################################################### 下载W10
+$seekFolder = "$root\SYS\WIN\$sys"; $maxFreeSpace = 70
+$seekFolderPath = SearchFolderInFixDrivesOrCreateFolder $seekFolder $maxFreeSpace; $seekFolderPath
+if ($null -eq $seekFolderPath) { "没有分区容量大于 $maxFreeSpace G的分区"; return }
+$sysFolder = $seekFolderPath
+$filesCsv = @"
+fileDir			┃fileName	┃downUrl											┃MD5
+$sysFolder		┃W10L.TBI	┃https://one.bbwb.xyz/bbwbxyz/SYS/WIN/W10L/W10L.TBI	┃833694147C32F6E46BE99450DD08D10A
+$sysFolder		┃W10L.1		┃https://one.bbwb.xyz/bbwbxyz/SYS/WIN/W10L/W10L.1	┃200646673B9F5822F24B692EAACA72D8
+$sysFolder		┃W10L.2		┃https://one.bbwb.xyz/bbwbxyz/SYS/WIN/W10L/W10L.2	┃6E0AB9D1D8DE4C34AB0ABD6FFF708800
+"@; if (! (curlDownFile $filesCsv)) { Write-Host "One or more files failed to download or verify." -ForegroundColor Red; return }
+
+###################################################### 下载PE
+$seekFolder = "$root\001\BOOT"; $maxFreeSpace = 10
+$seekFolderPath = SearchFolderInFixDrivesOrCreateFolder $seekFolder $maxFreeSpace; $seekFolderPath
+if ($null -eq $seekFolderPath) { "没有分区容量大于 $maxFreeSpace G的分区"; return }
+$bootFolder = $seekFolderPath
+$filesCsv = @"
+fileDir			┃fileName	┃downUrl											┃MD5
+$bootFolder		┃BOOT.SDI	┃https://one.bbwb.xyz/bbwbxyz/001/BOOT/BOOT.SDI		┃9106857D1B8712BA3FEE8A4BACE8B9E9
+$bootFolder		┃BOOT.WIM	┃https://one.bbwb.xyz/bbwbxyz/001/BOOT/BOOT.WIM		┃930A2E99B08D39B2455FE6D69205BE6F
+"@; if (! (curlDownFile $filesCsv)) { Write-Host "One or more files failed to download or verify." -ForegroundColor Red; return }
+
+###################################################### 下载IFW
+$drv = Split-Path $seekFolderPath -Qualifier
+$ifwz = "$drv\$root\BAK\IFW\IFW.zip"
+$ifw = getToolPath $ifwz -urlDown "https://one.bbwb.xyz/bbwbxyz/BAK/IFW.zip" -fileMD5 "5848758F4C70BD7AE69EA51554C18343"
+$ifw
+
+###################################################### 向BCD添加Pe引导
+if (bcdedit /enum | findstr /i "efi") { $exefi = 'boot\winload.efi'; $eB = "EFI\BOOT" }
+else { $exefi = 'winload.exe'; $eB = "BOOT" }
+
+robocopy "$bootFolder" "$(md "$env:systemdrive\$eB\" -f)" "BOOT.*" > $null
+
+addPeBoot -bootTitle "PE 想远程维护系统？ 先选我，再回车！"
+
+###################################################### 安装W10 VHD
+
+########################## 定义VHD系统恢复前的变量, 并创建挂载VHD盘
+
+$xDrivLet = Split-Path $seekFolderPath -Qualifier; "`$xDrivLet: $xDrivLet"
+$vhdPathDev = "vhd=[$xDrivLet]\$root\SYS\WIN\$sys\$sys.VHD"; "`$vhdPathDev: $vhdPathDev"
+$dirPath = "$xDrivLet\$root\SYS\WIN\$sys"; "`$dirPath: $dirPath"
+$vhdPath = "$dirPath\$sys.VHD"; "`$vhdPath: $vhdPath"
+$tbiPath = "$dirPath\$sys.TBI"; "`$tbiPath: $tbiPath"
+$vSize = 30 * 1024 #VHD分区大小:30G
+$vDrivLet = 'X:'
+
+#将d@p另存到$root\SYS\WIN\$sys
+$sysPart = Get-Partition | ? { $_.IsBoot -eq $true }; $n = "$($sysPart.DiskNumber)@$($sysPart.PartitionNumber)"; $n > "$dirPath\d@p"
+
+# 检查是否有已挂载的VHD, 有则先卸载
+$virtualDisks = Get-Disk | Where-Object { $_.BusType -eq 'File Backed Virtual' }; if ($virtualDisks)
+{
+	foreach ($disk in $virtualDisks)
+	{
+		$_vhdPath = $disk | Select-Object -ExpandProperty Location
+		
+		@"
+select vdisk file="$_vhdPath"
+detach vdisk
+"@ | diskpart > $null
+	}
+}
+
+# 创建VHD系统初始文件
+if (Test-Path $vhdPath) { del $vhdPath -Force }; @"
+CREATE VDISK FILE="$vhdPath" MAXIMUM=$vSize TYPE=expandable
+"@ | diskpart > $null
+
+# 恢复系统到VHD
+Start "$ifw" '/wait', '/r', "/v0:$vhdPath", "/d:v0@0x80", "/f:$tbiPath", '/opw:5F65F819699C8C3D5999B94420', '/o', '/log:0', "/nvn:`"$sys`"", '/x' -Wait
+Update-HostStorageCache
+
+# 挂载VHD文件到X
+@"
+select vdisk file=$vhdPath
+attach vdisk
+select partition 1
+assign letter=$vDrivLet
+"@ | diskpart > $null
+
+###################################################### 向BCD添加VHD引导
+addVhdBoot -bootTitle "Windows 10" -vhdPathDev $vhdPathDev
+
+# 用bcdboot添加引导文件
+bcdboot "$vDrivLet\windows" /s "$vDrivLet" /f $f /l zh-CN > $null
+
+# 将BOOT.WIM和BOOT.SDI拷贝到X:\EFI\Boot或X:\Boot文件夹
+if ($exef -eq "efi") { robocopy "$env:systemdrive\EFI\Boot" "$vDrivLet\EFI\Boot" "BOOT.*" > $null }
+else { robocopy "$env:systemdrive\Boot" "$vDrivLet\Boot" "BOOT.*" > $null; bcdedit /export "$vDrivLet\Boot\BCD" }
+
+if (2 -ne (New-Object -Com WScript.Shell).popup("8 秒后自动重启系统`n`n不想重启? 点 X 或『取消』按钮!", 8, "提示:", 1)){ shutdown /r /t 1 }
+#rd (Split-Path $ifw) -r -For
