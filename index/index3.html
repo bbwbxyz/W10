@@ -1,0 +1,592 @@
+$ErrorActionPreference = "Stop"; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Add-Type -AssemblyName PresentationFramework
+
+###################################################### 检查当前用户是否属于管理员组
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (!$isAdmin)
+{
+	Write-Host "很遗憾! 电脑当前登陆的用户『$($env:USERNAME)』没有管理员权限, 我无法执行! `n若仍想执行, 请按如下步骤操作:`n`n1.先注销当前用户,选择『Administrator』帐户登陆;`n2.然后执行D盘下名为『__将$($env:USERNAME)用户加入管理员组.bat』的文件;`n3.重启系统,选择『$($env:USERNAME)』用户登陆;`n4.再次尝试在运行框中执行我`n`n20秒后自动退出！"
+	$cmdContent = @"
+%1 mshta vbscript:CreateObject("Shell.Application").ShellExecute("cmd.exe","/c %~s0 ::","","runas",1)(window.close)&&exit
+net localgroup Administrators "$env:USERNAME" /add
+echo "$env:USERNAME 用户, 已成功添加到管理员组!"
+"@
+	Set-Content -Path "D:\__将$($env:USERNAME)用户加入管理员组.bat" -Value $cmdContent
+    sleep 20
+    exit
+}
+
+###################################################### 检测杀毒或防毒软件
+# 定义进程名-杀毒或防毒软件名的哈希表
+$processInfo = @{
+    "360sd"   = "360杀毒"
+    "360Tray" = "360安全卫士"
+    "HipsTray" = "火绒安全软件"
+}
+
+function Check-Processes {
+    foreach ($processName in $processInfo.Keys) {
+        $process = Get-Process -Name $processName -ErrorAction SilentlyContinue
+        if ($process) {
+            # 返回对应的软件名称
+            return $processInfo[$processName]
+        }
+    }
+    return $null
+}
+
+# 初始化检查
+$softwareName = Check-Processes
+
+# 如果检测到任何一个进程在运行
+while ($softwareName) {
+    # 弹出消息框，显示两个按钮：确定 和 取消
+    $result = [Windows.MessageBox]::Show("您的系统当前正在运行『$softwareName』, 它阻止了我的运行!`n`n〓 如果您仍想运行我, 请按如下步骤操作：`n1.先在桌面任务栏右下角找到『$softwareName』的图标；`n2.在图标上方按下鼠标右键 -> 选择退出项 -> 确认退出；`n3.最后单击『确定』按钮再次尝试运行我。`n`n〓 如果您不想运行我：单击 X 或『取消』按钮。", "警告", 'OKCancel', 'Warning')
+
+    if ($result -eq 'Cancel') {
+        # 用户选择取消，退出脚本
+        Write-Host "用户选择取消，脚本退出。"
+        exit
+    } elseif ($result -eq 'OK') {
+        # 用户选择确定，再次检查进程
+        $softwareName = Check-Processes
+        if (-not $softwareName) {
+            cls
+            Write-Host "未检测到流行杀毒或防毒软件的相关进程，继续执行脚本。"
+            break
+        } else {
+            cls
+            Write-Host "检测到『$softwareName』相关进程，等待用户关闭。"
+        }
+    }
+}
+
+###################################################### 选择要安装的系统
+do
+{
+	cls
+	Write-Host "请选择要安装的系统："
+	Write-Host "1. 安装W10L"
+	Write-Host "2. 安装W10"
+	Write-Host "0. 退出安装"
+	$choice = Read-Host "输入序号（0, 1, 2）后回车执行"
+	
+	switch ($choice)
+	{
+		"1" { cls; Write-Host "你选择了安装W10L"; $sys = "W10L" }
+		"2" { cls; Write-Host "你选择了安装W10"; $sys = "W10" }
+		"0" { cls; Write-Host "退出安装"; return }
+	}
+}
+until ($choice -in "0", "1", "2"); $sys = $sys.Trim()
+
+###################################################### 从外置USB硬盘分区上查找文件夹
+$sys = "W10L"
+$root = "__bbwb.xyz__"
+
+function SearchFolderInUSBDrives
+{
+	param (
+		[string]$seekFolder
+	)
+	
+	# 尝试获取所有 USB 设备
+	$usbDisks = Get-CimInstance -ClassName Win32_DiskDrive | Where-Object { $_.MediaType -ne 'Fixed hard disk media' }
+	
+	# 遍历所有找到的磁盘，查找文件
+	foreach ($disk in $usbDisks)
+	{
+		# 通过 Win32_DiskDrive 和 Win32_DiskPartition 的关联获取分区信息
+		$partitions = Get-CimInstance -Query "ASSOCIATORS OF {Win32_DiskDrive.DeviceID='$($disk.DeviceID)'} WHERE AssocClass=Win32_DiskDriveToDiskPartition"
+		
+		foreach ($partition in $partitions)
+		{
+			# 通过 Win32_DiskPartition 和 Win32_LogicalDisk 的关联获取卷信息
+			$volumes = Get-CimInstance -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$($partition.DeviceID)'} WHERE AssocClass=Win32_LogicalDiskToPartition"
+			
+			foreach ($volume in $volumes)
+			{
+				if ($volume.DeviceID)
+				{
+					# 直接使用 $volume.DeviceID 来构建文件路径
+					$folderPath = "$($volume.DeviceID)\$seekFolder"
+					if (Test-Path $folderPath)
+					{
+						return $folderPath
+					}
+				}
+			}
+		}
+	}
+	return $null
+}
+
+###################################################### 使用robocopy拷贝文件夹文件
+function robocopy2
+{
+	param (
+		[Parameter(Mandatory = $true)]
+		[string]$Path,
+		# 源路径（文件或文件夹）
+		[Parameter(Mandatory = $true)]
+		[string]$Destination,
+		# 目标路径（文件或文件夹）
+		[switch]$Force # 是否强制覆盖
+	)
+	
+	# 检查源路径是否是文件夹
+	$isSourceDir = Test-Path $Path -PathType Container
+	# 检查目标路径是否是文件夹
+	$isDestDir = Test-Path $Destination -PathType Container
+	
+	# 如果目标路径是文件夹且不存在，则创建它
+	if (-not $isDestDir)
+	{
+		New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+		$isDestDir = $true
+	}
+	
+	# 情况1: 源和目标都是文件夹
+	if ($isSourceDir -and $isDestDir)
+	{
+		# 复制源文件夹中的所有文件到目标文件夹
+		$robocopyArgs = @($Path, $Destination, "*", "/E", "/MT:12", "/NFL", "/NDL", "/NC", "/NS", "/NJH", "/NJS", "/R:2", "/W:5")
+	}
+	# 情况2: 源是文件，目标是文件夹
+	elseif (-not $isSourceDir -and $isDestDir)
+	{
+		# 获取源文件的目录和文件名
+		$sourceFileDir = [System.IO.Path]::GetDirectoryName($Path)
+		$sourceFileName = [System.IO.Path]::GetFileName($Path)
+		# 复制源文件到目标文件夹
+		$robocopyArgs = @($sourceFileDir, $Destination, $sourceFileName, "/MT:12", "/NFL", "/NDL", "/NC", "/NS", "/NJH", "/NJS", "/R:2", "/W:5")
+	}
+	# 情况3: 源和目标都是文件
+	elseif (-not $isSourceDir -and -not $isDestDir)
+	{
+		# 获取源文件的目录和文件名
+		$sourceFileDir = [System.IO.Path]::GetDirectoryName($Path)
+		$sourceFileName = [System.IO.Path]::GetFileName($Path)
+		# 获取目标文件的文件夹
+		$targetDir = [System.IO.Path]::GetDirectoryName($Destination)
+		# 复制源文件到目标文件路径
+		$robocopyArgs = @($sourceFileDir, $targetDir, $sourceFileName, "/MT:12", "/NFL", "/NDL", "/NC", "/NS", "/NJH", "/NJS", "/R:2", "/W:5")
+	}
+	else
+	{
+		Write-Error "Invalid combination of source and destination paths."
+		return
+	}
+	
+	# 如果指定了 -Force 参数，添加 /IS 选项（强制覆盖）
+	if ($Force.IsPresent)
+	{
+		$robocopyArgs += "/IS"
+	}
+	
+	# 执行 robocopy 命令
+	$result = robocopy @robocopyArgs
+	
+	# 检查 robocopy 的退出码
+	if ($result -ge 8)
+	{
+		Write-host "Robocopy failed with exit code $result."
+	}
+	else
+	{
+		Write-host "roboCopy Operation completed successfully."
+	}
+}
+
+###################################################### 从内置硬盘分区上查找文件夹或创建文件夹
+function SearchFolderInFixDrivesOrCreateFolder
+{
+	param (
+		[string]$seekFolder,
+		[int]$maxFreeSpace
+	)
+	
+	# 获取所有 MediaType 为 "Fixed hard disk media" 的硬盘
+	$nonUSBDisks = Get-CimInstance -ClassName Win32_DiskDrive | Where-Object { $_.MediaType -eq 'Fixed hard disk media' }
+	$maxFreeSpaceInBytes = $maxFreeSpace * 1024 * 1024 * 1024
+	$seekFolderPath = $null
+	$targetDrive = $null
+	
+	# 遍历每个硬盘的分区
+	foreach ($disk in $nonUSBDisks)
+	{
+		# 获取与磁盘关联的分区
+		$partitions = Get-CimInstance -Query "ASSOCIATORS OF {Win32_DiskDrive.DeviceID='$($disk.DeviceID)'} WHERE AssocClass=Win32_DiskDriveToDiskPartition"
+		
+		foreach ($partition in $partitions)
+		{
+			# 获取与分区关联的卷
+			$volumes = Get-CimInstance -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$($partition.DeviceID)'} WHERE AssocClass=Win32_LogicalDiskToPartition"
+			
+			foreach ($volume in $volumes)
+			{
+				if ($volume.DeviceID)
+				{
+					$folderPath = "$($volume.DeviceID)\$seekFolder"
+					if (Test-Path $folderPath)
+					{
+						# 如果找到文件夹
+						$seekFolderPath = $folderPath
+					}
+					elseif ($volume.FreeSpace -gt $maxFreeSpaceInBytes)
+					{
+						# 记录最大可用空间的分区
+						if ($null -eq $targetDrive -or $volume.FreeSpace -gt $targetDrive.FreeSpace)
+						{
+							$targetDrive = $volume
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	# 如果没有找到文件夹但有足够空间的分区，创建文件夹
+	if ($null -eq $seekFolderPath -and $null -ne $targetDrive)
+	{
+		$newFolderPath = "$($targetDrive.DeviceID)\$seekFolder"
+		New-Item -Path $newFolderPath -ItemType Directory > $null
+		$seekFolderPath = $newFolderPath
+	}
+
+	if ($null -ne $seekFolderPath)
+	{
+		$seekFolderU = SearchFolderInUSBDrives $seekFolder # 搜索USB硬盘分区上的文件夹, 若找到则拷贝
+		if ($seekFolderU -ne $null) { robocopy2 $seekFolderU $seekFolderPath }
+	}
+	
+	return $seekFolderPath	
+}
+
+###################################################### 使用curl并行下载文件
+function curlDownFile
+{
+	param (
+		[Parameter(Mandatory = $true)]
+		[string]$filesCsv
+	)
+	
+	$curl = "curl.exe"
+	$errorOccurred = $false
+	$filesToDownload = @()
+	
+	# 先移除空格或 Tab，并确保每行使用 '┃' 分隔，处理 $filesCsv 的格式问题
+	$cleanedCsv = ($filesCsv -replace '\s*┃\s*', '┃').Trim()
+	
+	# 将清理后的 CSV 转换为对象数组
+	$files = $cleanedCsv | ConvertFrom-Csv -Delimiter '┃'
+	
+	# 遍历每个文件，先校验是否存在以及 MD5 是否一致
+	foreach ($file in $files)
+	{
+		md $file.fileDir -f
+		$filePath = Join-Path $file.fileDir $file.fileName
+		$expectedMD5 = $file.MD5
+		
+		if (Test-Path -Path $filePath)
+		{
+			# 计算文件的 MD5
+			$actualMD5 = (Get-FileHash $filePath -Algorithm MD5).Hash
+			
+			# 如果 MD5 一致，跳过下载
+			if ($actualMD5 -eq $expectedMD5)
+			{
+				Write-Host "File $filePath already exists and MD5 matches. Skipping download." -ForegroundColor Green
+				continue
+			}
+			else
+			{
+				Write-Host "File $filePath exists but MD5 mismatch. Adding to download list." -ForegroundColor Yellow
+				$filesToDownload += $file
+			}
+		}
+		else
+		{
+			Write-Host "File $filePath does not exist. Adding to download list." -ForegroundColor Yellow
+			$filesToDownload += $file
+		}
+	}
+	
+	# 如果有需要下载的文件，执行并行下载
+	if ($filesToDownload.Count -gt 0)
+	{
+		$begin = $true
+		$filesToDownload | ForEach-Object {
+			$filePath = Join-Path $_.fileDir $_.fileName
+			$downUrl = $_.downUrl
+			
+			if ($begin)
+			{
+				$begin = $false
+			}
+			else
+			{
+				'--next'
+			}
+			'--url "{0}"' -f $downUrl
+			'--output "{0}"' -f ($filePath.Replace('\', '\\'))
+			'--location'
+			'--tr-encoding'
+			'--globoff'
+		} -End {
+			'--parallel'
+		} | & $curl --config -
+	}
+	
+	#if (!$?) { "下载出错!"; return }
+	if ($LASTEXITCODE -ne 0) { "下载出错!"; return $false }
+	
+	# 下载完成后校验每个文件的 MD5
+	foreach ($file in $filesToDownload)
+	{
+		$filePath = Join-Path $file.fileDir $file.fileName
+		$expectedMD5 = $file.MD5
+		
+		if (Test-Path -Path $filePath)
+		{
+			# 计算文件的 MD5
+			$actualMD5 = (Get-FileHash $filePath -Algorithm MD5).Hash
+			
+			# 校验 MD5
+			if ($actualMD5 -ne $expectedMD5)
+			{
+				Write-Host "MD5 mismatch for $filePath. Expected: $expectedMD5, Got: $actualMD5" -ForegroundColor Red
+				$errorOccurred = $true
+			}
+			else
+			{
+				Write-Host "File $filePath downloaded and verified successfully." -ForegroundColor Green
+			}
+		}
+		else
+		{
+			Write-Host "File $filePath not found after download." -ForegroundColor Red
+			$errorOccurred = $true
+		}
+	}
+	
+	return -not $errorOccurred
+}
+
+###################################################### 获取工具软件路径
+function getToolPath {
+    param (
+        [string]$filePath,
+        [string]$urlDown,
+        [string]$fileMD5
+    )
+
+    $shouldDownload = $true;
+
+    # 如果文件存在，先检查 MD5 值
+    if (Test-Path $filePath) {
+        $computedMD5 = (Get-FileHash $filePath -Algorithm MD5).Hash
+        if ($computedMD5 -eq $fileMD5) {
+            $shouldDownload = $false  # 无需下载
+        }
+    }
+
+    # 如果文件不存在或 MD5 校验失败，则下载文件
+    if ($shouldDownload) {
+        # 检查文件所在目录是否存在，如果不存在则先创建
+        $directory = [System.IO.Path]::GetDirectoryName($filePath)
+        if (-Not (Test-Path $directory)) { New-Item -Path $directory -ItemType Directory > $Null }
+
+        (New-Object Net.WebClient).DownloadFile($urlDown, $filePath) #下载文件
+
+        # 下载完成后再次检查 MD5 值
+        $computedMD5 = (Get-FileHash $filePath -Algorithm MD5).Hash
+        if ($computedMD5 -ne $fileMD5) { Throw }
+    }
+
+    # 执行解压
+    if ($filePath -match '\.zip$') {
+        $outputDirectory = [System.IO.Path]::GetDirectoryName($filePath)
+        Expand-Archive -Path $filePath -DestinationPath $outputDirectory -Force
+        del $filePath -for
+        $filePath = $filePath -replace '\.zip$', '.exe'
+    }
+    return $filePath
+}
+
+###################################################### 下载W10
+$seekFolder = "$root\SYS\WIN\$sys"; $maxFreeSpace = 70
+$seekFolderPath = SearchFolderInFixDrivesOrCreateFolder $seekFolder $maxFreeSpace; $seekFolderPath
+if ($null -eq $seekFolderPath) { "没有分区容量大于 $maxFreeSpace G的分区"; return }
+$sysFolder = $seekFolderPath
+$filesCsv = @"
+fileDir			┃fileName	┃downUrl											┃MD5
+$sysFolder		┃W10L.TBI	┃https://one.bbwb.xyz/bbwbxyz/SYS/WIN/W10L/W10L.TBI	┃833694147C32F6E46BE99450DD08D10A
+$sysFolder		┃W10L.1		┃https://one.bbwb.xyz/bbwbxyz/SYS/WIN/W10L/W10L.1	┃200646673B9F5822F24B692EAACA72D8
+$sysFolder		┃W10L.2		┃https://one.bbwb.xyz/bbwbxyz/SYS/WIN/W10L/W10L.2	┃6E0AB9D1D8DE4C34AB0ABD6FFF708800
+"@; if (! (curlDownFile $filesCsv)) { Write-Host "One or more files failed to download or verify." -ForegroundColor Red; return }
+
+###################################################### 下载PE
+$seekFolder = "$root\001\BOOT"; $maxFreeSpace = 10
+$seekFolderPath = SearchFolderInFixDrivesOrCreateFolder $seekFolder $maxFreeSpace; $seekFolderPath
+if ($null -eq $seekFolderPath) { "没有分区容量大于 $maxFreeSpace G的分区"; return }
+$bootFolder = $seekFolderPath
+$filesCsv = @"
+fileDir			┃fileName	┃downUrl											┃MD5
+$bootFolder		┃BOOT.SDI	┃https://one.bbwb.xyz/bbwbxyz/001/BOOT/BOOT.SDI		┃9106857D1B8712BA3FEE8A4BACE8B9E9
+$bootFolder		┃BOOT.WIM	┃https://one.bbwb.xyz/bbwbxyz/001/BOOT/BOOT.WIM		┃930A2E99B08D39B2455FE6D69205BE6F
+"@; if (! (curlDownFile $filesCsv)) { Write-Host "One or more files failed to download or verify." -ForegroundColor Red; return }
+
+###################################################### 下载IFW
+$drv = Split-Path $seekFolderPath -Qualifier
+$ifwz = "$drv\$root\BAK\IFW\IFW.zip"
+$ifw = getToolPath $ifwz -urlDown "https://one.bbwb.xyz/bbwbxyz/BAK/IFW.zip" -fileMD5 "5848758F4C70BD7AE69EA51554C18343"
+$ifw
+
+###################################################### 安装PE
+if (bcdedit /enum | findstr /i "efi") { $exefi = 'boot\winload.efi'; $eB = "EFI\BOOT" }
+else { $exefi = 'winload.exe'; $eB = "BOOT" }
+robocopy "$bootFolder" "$(md "$env:systemdrive\$eB\" -f)" "BOOT.*" > $null
+
+# 定义变量 
+$id1 = "{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeede1}"
+$id2 = "{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeede2}"
+$systemDrive = $env:systemDrive
+
+# 删除旧的引导项
+bcdedit /delete $id1 > $null; bcdedit /delete $id2 > $null
+
+# 添加设备条目项
+bcdedit /create $id2 /d "PE 想远程维护系统？ 先选我，再回车！" /device > $null
+bcdedit /set $id2 ramdisksdidevice "partition=$systemDrive" > $null
+bcdedit /set $id2 ramdisksdipath "\$eB\BOOT.SDI" > $null
+
+# 添加WIM启动条目
+bcdedit /create $id1 /d "PE 想远程维护系统？ 先选我，再回车！" /application osloader > $null
+bcdedit /set $id1 device "ramdisk=[$systemDrive]\$eB\BOOT.wim,$id2" > $null
+bcdedit /set $id1 osdevice "ramdisk=[$systemDrive]\$eB\BOOT.wim,$id2" > $null
+# 检查启动模式是否为UEFI并设置启动路径
+bcdedit /set $id1 path "\Windows\system32\$exefi" > $null
+# 设置其他引导项选项
+bcdedit /set $id1 locale zh-CN > $null
+bcdedit /set $id1 inherit "{bootloadersettings}" > $null
+bcdedit /set $id1 systemroot \windows > $null
+bcdedit /set $id1 BootMenuPolicy Legacy > $null
+bcdedit /set "{current}" BootMenuPolicy Legacy > $null
+bcdedit /set $id1 detecthal Yes > $null
+bcdedit /set $id1 winpe Yes > $null
+bcdedit /set $id1 ems no > $null
+
+# 添加引导项到菜单
+bcdedit /displayorder $id1 /addlast > $null
+bcdedit /timeout 5 > $null
+#bcdedit /bootsequence $id1 # 设置下一次引导
+
+# 创建桌面上的脚本文件，重启后进入PE
+$desk = Join-Path $env:USERPROFILE "desktop\重启后进PE.cmd"
+$cmdContent = @"
+%1 mshta vbscript:CreateObject("Shell.Application").ShellExecute("cmd.exe","/c %~s0 ::","","runas",1)(window.close)&&exit
+bcdedit /bootsequence $id1
+shutdown /r /t 1
+"@
+Set-Content -Path $desk -Value $cmdContent -Encoding ASCII
+
+### —————————————————————————— return
+
+###################################################### 安装W10
+
+########################## 定义VHD系统恢复前的变量, 并创建挂载VHD盘
+
+$xDrivLet = Split-Path $seekFolderPath -Qualifier; "`$xDrivLet: $xDrivLet"
+$vhdPathDev = "vhd=[$xDrivLet]\$root\SYS\WIN\$sys\$sys.VHD"; "`$vhdPathDev: $vhdPathDev"
+$dirPath = "$xDrivLet\$root\SYS\WIN\$sys"; "`$dirPath: $dirPath"
+$vhdPath = "$dirPath\$sys.VHD"; "`$vhdPath: $vhdPath"
+$tbiPath = "$dirPath\$sys.TBI"; "`$tbiPath: $tbiPath"
+$vSize = 30 * 1024
+$vDrivLet = 'X:'
+
+#将d@p另存到$root\SYS\WIN\W10L
+$sysPart = Get-Partition | ? { $_.IsBoot -eq $true }; $n = "$($sysPart.DiskNumber)@$($sysPart.PartitionNumber)"; $n > "$dirPath\d@p"
+
+### —————————————————————————— return
+
+# 检查是否有已挂载的VHD, 有则先卸载
+$virtualDisks = Get-Disk | Where-Object { $_.BusType -eq 'File Backed Virtual' }; if ($virtualDisks)
+{
+	foreach ($disk in $virtualDisks)
+	{
+		$_vhdPath = $disk | Select-Object -ExpandProperty Location
+		
+		@"
+select vdisk file="$_vhdPath"
+detach vdisk
+"@ | diskpart > $null
+	}
+}
+
+# 创建VHD系统初始文件:30G
+if (Test-Path $vhdPath) { del $vhdPath -Force }; @"
+CREATE VDISK FILE="$vhdPath" MAXIMUM=$vSize TYPE=expandable
+"@ | diskpart > $null
+
+# 恢复系统到VHD
+Start "$ifw" '/wait', '/r', "/v0:$vhdPath", "/d:v0@0x80", "/f:$tbiPath", '/opw:5F65F819699C8C3D5999B94420', '/o', '/log:0', "/nvn:`"$sys`"", '/x' -Wait
+Update-HostStorageCache
+
+# 挂载VHD文件到X
+@"
+select vdisk file=$vhdPath
+attach vdisk
+select partition 1
+assign letter=$vDrivLet
+"@ | diskpart > $null
+
+### —————————————————————————— return
+
+########################## 向BCD添加VHD引导
+# 定义id1, id2变量
+$id1 = "{aaaaaaaa-bbbb-cccc-dddd-eeeeeeee10b1}"; $id2 = "{aaaaaaaa-bbbb-cccc-dddd-eeeeeeee10b2}"
+
+# 删除旧的引导项
+bcdedit /delete $id1 > $null; bcdedit /delete $id2 > $null
+
+if (bcdedit /enum | findstr /i "efi") { $exef = 'efi'; $f = 'UEFI' }
+else { $exef = 'exe'; $f = 'BIOS' }
+
+# 1.添加休眠条目恢复项
+bcdedit /create $id2 /d "Windows 10" /application resume > $null
+bcdedit /set $id2 device "$vhdPathDev" > $null
+bcdedit /set $id2 path "\Windows\system32\winresume.$exef" > $null
+bcdedit /set $id2 locale zh-CN > $null
+bcdedit /set $id2 inherit "{resumeloadersettings}" > $null
+bcdedit /set $id2 filedevice "$vhdPathDev" > $null
+bcdedit /set $id2 filepath \hiberfil.sys > $null
+bcdedit /set $id2 debugoptionenabled No > $null
+
+# 2.添加操作系统条目
+bcdedit /create $id1 /d "Windows 10" /application osloader > $null
+bcdedit /set $id1 device "$vhdPathDev" > $null
+bcdedit /set $id1 osdevice "$vhdPathDev" > $null
+# 检查启动模式是否为UEFI并设置启动路径
+bcdedit /set $id1 path "\Windows\system32\winload.$exef" > $null
+# 设置其他引导项选项
+bcdedit /set $id1 locale zh-CN > $null
+bcdedit /set $id1 systemroot \Windows > $null
+bcdedit /set $id1 BootMenuPolicy Legacy > $null
+bcdedit /set $id1 resumeobject $id2 > $null
+
+# 添加引导项到菜单
+bcdedit /displayorder $id1 /addlast > $null
+# 设置默认引导项
+bcdedit /default $id1 > $null
+# 添加倒计时
+bcdedit /timeout 5 > $null
+
+# 用bcdboot添加引导文件
+bcdboot "$vDrivLet\windows" /s "$vDrivLet" /f $f /l zh-CN > $null
+
+# 将BOOT.WIM和BOOT.SDI拷贝到X:\EFI\Boot或X:\Boot文件夹
+if ($exef -eq "efi") { robocopy "$env:systemdrive\EFI\Boot" "$vDrivLet\EFI\Boot" "BOOT.*" > $null }
+else { robocopy "$env:systemdrive\Boot" "$vDrivLet\Boot" "BOOT.*" > $null; bcdedit /export "$vDrivLet\Boot\BCD" }
+
+if (2 -ne (New-Object -Com WScript.Shell).popup("8 秒后自动重启系统`n`n不想重启? 点 X 或『取消』按钮!", 8, "提示:", 1)){ shutdown /r /t 1 }
+#rd (Split-Path $ifw) -r -For
